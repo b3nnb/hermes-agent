@@ -468,6 +468,159 @@ class TestEventFilter:
 
 
 # ===================================================================
+# Payload filtering (subscription `filter` field)
+# ===================================================================
+
+
+class TestPayloadFilter:
+    """Tests for the optional dotted-path payload filter in _handle_webhook."""
+
+    def _gh_routes(self):
+        # Mirrors the real github-ci-failure subscription shape.
+        return {
+            "gh-ci": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["workflow_run"],
+                "filter": {
+                    "action": "completed",
+                    "workflow_run.conclusion": "failure",
+                },
+                "prompt": "failed run {workflow_run.html_url}",
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_filter_accepts_matching_payload(self):
+        """completed+failure passes the filter and spawns a session."""
+        adapter = _make_adapter(routes=self._gh_routes())
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/gh-ci",
+                json={
+                    "action": "completed",
+                    "workflow_run": {"conclusion": "failure", "id": 42},
+                },
+                headers={"X-GitHub-Event": "workflow_run"},
+            )
+            assert resp.status == 202
+            adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_filter_rejects_requested_action(self):
+        """GitHub fires `requested` before the run completes — must be ignored."""
+        adapter = _make_adapter(routes=self._gh_routes())
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/gh-ci",
+                json={
+                    "action": "requested",
+                    "workflow_run": {"conclusion": None, "id": 42},
+                },
+                headers={"X-GitHub-Event": "workflow_run"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["status"] == "ignored"
+            adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_filter_rejects_success_conclusion(self):
+        """completed+success must be ignored (no agent session)."""
+        adapter = _make_adapter(routes=self._gh_routes())
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/gh-ci",
+                json={
+                    "action": "completed",
+                    "workflow_run": {"conclusion": "success", "id": 42},
+                },
+                headers={"X-GitHub-Event": "workflow_run"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["status"] == "ignored"
+            adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_filter_list_value_any_of(self):
+        """A list expected value matches any member (OR within one key)."""
+        routes = {
+            "pr": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["pull_request"],
+                "filter": {"action": ["opened", "reopened"]},
+                "prompt": "PR {action}",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/pr",
+                json={"action": "reopened"},
+                headers={"X-GitHub-Event": "pull_request"},
+            )
+            assert resp.status == 202
+
+            resp2 = await cli.post(
+                "/webhooks/pr",
+                json={"action": "closed"},
+                headers={"X-GitHub-Event": "pull_request"},
+            )
+            assert resp2.status == 200
+            data = await resp2.json()
+            assert data["status"] == "ignored"
+
+    @pytest.mark.asyncio
+    async def test_filter_missing_path_ignored(self):
+        """Missing dotted path (payload lacks the key) counts as a mismatch."""
+        adapter = _make_adapter(routes=self._gh_routes())
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/gh-ci",
+                json={"action": "completed"},  # no workflow_run key
+                headers={"X-GitHub-Event": "workflow_run"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["status"] == "ignored"
+
+    @pytest.mark.asyncio
+    async def test_no_filter_behaves_as_before(self):
+        """Routes without a filter accept everything (backwards compat)."""
+        routes = {
+            "plain": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "got it",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/plain",
+                json={"anything": "goes"},
+            )
+            assert resp.status == 202
+
+
+# ===================================================================
 # HTTP handling
 # ===================================================================
 

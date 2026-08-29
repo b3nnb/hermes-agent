@@ -478,6 +478,42 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"status": "ignored", "event": event_type}
             )
 
+        # Check optional payload filter. Keys are dotted paths into the JSON
+        # payload; every key must match (AND). A list value means any-of
+        # (OR within a single key). Non-matching requests return 200
+        # {"status": "ignored"} WITHOUT spawning an agent session — use this
+        # to gate noisy webhooks on payload fields, e.g. GitHub workflow_run
+        # events where only `action=completed` + `workflow_run.conclusion=
+        # failure` should trigger a run.
+        route_filter = route_config.get("filter")
+        if route_filter:
+            def _dig(obj, dotted_path):
+                cur = obj
+                for part in dotted_path.split("."):
+                    if not isinstance(cur, dict) or part not in cur:
+                        return None
+                    cur = cur[part]
+                return cur
+
+            for filter_path, expected in route_filter.items():
+                actual = _dig(payload, filter_path)
+                if isinstance(expected, list):
+                    matched = actual in expected
+                else:
+                    matched = actual == expected
+                if not matched:
+                    logger.debug(
+                        "[webhook] Filter mismatch on route %s: %s=%r "
+                        "(expected %r) — ignoring",
+                        route_name,
+                        filter_path,
+                        actual,
+                        expected,
+                    )
+                    return web.json_response(
+                        {"status": "ignored", "filter": filter_path}
+                    )
+
         # Format prompt from template
         prompt_template = route_config.get("prompt", "")
         prompt = self._render_prompt(
